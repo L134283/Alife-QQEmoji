@@ -59,9 +59,8 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 
 ## 安装
 
-将 `Alife.Plugin.QQEmoji` 文件夹放入 Alife 的 `Storage/Plugins` 目录，在客户端重载模块即可。
+直接在alife插件市场中下载  或者  将 `Alife.Plugin.QQEmoji` 文件夹放入 Alife 的 `Storage/Plugins` 目录，在客户端重载模块即可。
 
 ## 致谢
 
-感谢 **周武** 提供的 EmoteStealerService.cs 参考实现。
-感谢 **爱奈丽** 提供的 StickerManager 插件参考。
+感谢 **周武** **爱奈丽** 提供的 EmoteStealerService.cs 参考。
