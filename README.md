@@ -5,6 +5,7 @@
 
 <img width="938" height="421" alt="image" src="https://github.com/user-attachments/assets/bda80e78-7219-4432-95c2-de49a7c3e8d3" />
 
+
 ## 快速上手
 
 跟 AI 说一句话就能存图：
@@ -44,8 +45,11 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 ## v1.1.0 主要更新
 
 - **彻底修复原版 Bug**：弃用 `OnChatSend` 拼接返回值的做法，改为订阅 `ChatOver` 事件，将 `<qimage>` 标签**直接拼接到 AI 回复消息的 Content 末尾**，表情包显示为 bot 消息的一部分，不会再被框架误判为用户消息回显
-- **不再使用 `Poke()`**：表情包通过修改 `ChatHistory` 中 Assistant 消息的内容实现，不经过系统通知通道，避免显示为 `[来自系统的杂项消息推送]`
-- **消除编译依赖**：移除对 `AuthorRole` 类型的硬引用，改用 `ChatHistory[^1]` 索引，兼容 Alife 模块编译器
+- **双链路发图**：同时支持 Alife 本地窗口渲染（修改 `ChatHistory` 的 Content）和 QQ 发送（通过反射调用 `QChatService.QImage` 发送 `[CQ:image]`），两边都能看到表情包
+- **智能触发范围**：仅对 `<qchat>` 格式（QQ 聊天消息）触发表情包，`<speak>` 等其他格式自动跳过
+- **不再使用 `Poke()`**：表情包不再经过系统通知通道，避免显示为 `[来自系统的杂项消息推送]`
+- **消除模块编译器依赖**：移除对 `AuthorRole`、`ChatActivity.Plugins`、`ChatActivity.PluginService` 的硬引用，改用 `ChatHistory[^1]` 索引 + 反射读取私有 `plugins` 字段获取 QChatService 实例，兼容 Alife 模块编译器
+- **qimage 格式完善**：`<qimage>` 标签完整包含 `type`、`targetid`、`image` 三个属性，Alife 渲染器可正确识别
 - **提示词更新**：发图格式增加 `type` 和 `targetid` 属性，AI 可区分私聊与群聊
 - **生命周期完善**：添加 `DestroyAsync` 注销事件，防止重复注册
 
@@ -82,6 +86,11 @@ AI 根据对话场景选择：
 ## 安装
 
 直接在 Alife 插件市场中下载；或将 `Alife.Plugin.QQEmoji` 文件夹放入 Alife 的 `Storage/Plugins` 目录，在客户端重载模块即可。
+
+## 致谢
+
+感谢 **周武** **爱奈丽** 提供的 EmoteStealerService.cs 参考。
+
 
 ## 致谢
 
