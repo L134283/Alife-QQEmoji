@@ -1,6 +1,9 @@
 # QQ表情包管家
 
 一键存图 + AI 智能发图，完整的 QQ 表情包管理插件。
+<img width="974" height="843" alt="image" src="https://github.com/user-attachments/assets/6825cf7d-be68-4160-a6c2-88d5d2f8cce4" />
+
+<img width="938" height="421" alt="image" src="https://github.com/user-attachments/assets/bda80e78-7219-4432-95c2-de49a7c3e8d3" />
 
 ## 快速上手
 
