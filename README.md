@@ -1,10 +1,10 @@
+<img width="763" height="781" alt="image" src="https://github.com/user-attachments/assets/a0610138-c015-439d-bbaa-8da2ee8377c3" />
+<img width="842" height="784" alt="image" src="https://github.com/user-attachments/assets/7f66d825-86d2-4bb3-a985-374d0a97d033" />
+
+
 # QQ表情包管家
 
 一键存图 + AI 智能发图，完整的 QQ 表情包管理插件。
-<img width="974" height="843" alt="image" src="https://github.com/user-attachments/assets/6825cf7d-be68-4160-a6c2-88d5d2f8cce4" />
-
-<img width="938" height="421" alt="image" src="https://github.com/user-attachments/assets/bda80e78-7219-4432-95c2-de49a7c3e8d3" />
-
 
 ## 快速上手
 
@@ -44,7 +44,7 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 
 ## v1.1.0 主要更新
 
-- **彻底修复原版 Bug**：弃用 `OnChatSend` 拼接返回值的做法，改为订阅 `ChatOver` 事件，将 `<qimage>` 标签**直接拼接到 AI 回复消息的 Content 末尾**，表情包显示为 bot 消息的一部分，不会再被框架误判为用户消息回显
+- **彻底修复原版 Bug(并没有)**：弃用 `OnChatSend` 拼接返回值的做法，改为订阅 `ChatOver` 事件，将 `<qimage>` 标签**直接拼接到 AI 回复消息的 Content 末尾**，表情包显示为 bot 消息的一部分，不会再被框架误判为用户消息回显
 - **双链路发图**：同时支持 Alife 本地窗口渲染（修改 `ChatHistory` 的 Content）和 QQ 发送（通过反射调用 `QChatService.QImage` 发送 `[CQ:image]`），两边都能看到表情包
 - **智能触发范围**：仅对 `<qchat>` 格式（QQ 聊天消息）触发表情包，`<speak>` 等其他格式自动跳过
 - **不再使用 `Poke()`**：表情包不再经过系统通知通道，避免显示为 `[来自系统的杂项消息推送]`
@@ -52,6 +52,15 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 - **qimage 格式完善**：`<qimage>` 标签完整包含 `type`、`targetid`、`image` 三个属性，Alife 渲染器可正确识别
 - **提示词更新**：发图格式增加 `type` 和 `targetid` 属性，AI 可区分私聊与群聊
 - **生命周期完善**：添加 `DestroyAsync` 注销事件，防止重复注册
+
+## v1.2.0 主要更新
+
+- **修复已知bug，请务必更新**
+- **启动时注入最新表情包列表**：桌宠启动时自动拉取路径下最新表情包列表并注入系统提示词，增强对表情包的记忆
+- **新增表情包列表自动更新**：存图达到自定义阈值后自动刷新 AI 上下文中的表情包列表，让 AI 始终知晓最新可用表情
+- **新增日志输出开关**：可在 UI 中开启/关闭控制台日志输出，方便排查问题
+- **新增预览数量上限配置**：控制注入 AI 提示中的表情列表条数上限，避免 token 浪费
+- **UI 配置面板完善**：新增「表情包列表更新」「表情包显示上限」「调试设置」配置区块
 
 ## 配置项
 
@@ -65,6 +74,10 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 | 情绪加权 | 开 | 检测关键词动态加概率 |
 | 冷却机制 | 开 | 是否启用冷却 |
 | 连发限制 | 开 | 是否启用连发上限 |
+| 存图自动更新列表 | 开 | 存图后自动刷新 AI 上下文中的表情列表 |
+| 更新阈值 | 5 个图 | 存满 N 个图触发一次列表更新 |
+| 预览上限 | 50 条 | 注入提示的表情列表条数上限，0=不限制 |
+| 日志输出 | 关 | 在运行窗口显示插件运行日志 |
 
 ## AI 可用函数
 
