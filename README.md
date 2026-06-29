@@ -1,7 +1,3 @@
-<img width="763" height="781" alt="image" src="https://github.com/user-attachments/assets/a0610138-c015-439d-bbaa-8da2ee8377c3" />
-<img width="842" height="784" alt="image" src="https://github.com/user-attachments/assets/7f66d825-86d2-4bb3-a985-374d0a97d033" />
-
-
 # QQ表情包管家
 
 一键存图 + AI 智能发图，完整的 QQ 表情包管理插件。
@@ -26,6 +22,7 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 | **防刷屏** | 冷却时间 + 连发限制 + 线程锁 |
 | **策略模式** | 平衡 / 保守 / 活跃，一键切换 |
 | **qimage 格式** | 支持 `type`（Private/Group）和 `targetid`（QQ号/群号）属性 |
+| **在线搜图** | AI 用 `SearchBqbOnline` 搜索 ChineseBQB 在线表情包库，搜到后下载到本地再发送 |
 
 ## 原理
 
@@ -44,7 +41,7 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 
 ## v1.1.0 主要更新
 
-- **彻底修复原版 Bug(并没有)**：弃用 `OnChatSend` 拼接返回值的做法，改为订阅 `ChatOver` 事件，将 `<qimage>` 标签**直接拼接到 AI 回复消息的 Content 末尾**，表情包显示为 bot 消息的一部分，不会再被框架误判为用户消息回显
+- **彻底修复原版 Bug**：弃用 `OnChatSend` 拼接返回值的做法，改为订阅 `ChatOver` 事件，将 `<qimage>` 标签**直接拼接到 AI 回复消息的 Content 末尾**，表情包显示为 bot 消息的一部分，不会再被框架误判为用户消息回显
 - **双链路发图**：同时支持 Alife 本地窗口渲染（修改 `ChatHistory` 的 Content）和 QQ 发送（通过反射调用 `QChatService.QImage` 发送 `[CQ:image]`），两边都能看到表情包
 - **智能触发范围**：仅对 `<qchat>` 格式（QQ 聊天消息）触发表情包，`<speak>` 等其他格式自动跳过
 - **不再使用 `Poke()`**：表情包不再经过系统通知通道，避免显示为 `[来自系统的杂项消息推送]`
@@ -52,6 +49,7 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 - **qimage 格式完善**：`<qimage>` 标签完整包含 `type`、`targetid`、`image` 三个属性，Alife 渲染器可正确识别
 - **提示词更新**：发图格式增加 `type` 和 `targetid` 属性，AI 可区分私聊与群聊
 - **生命周期完善**：添加 `DestroyAsync` 注销事件，防止重复注册
+
 
 ## v1.2.0 主要更新
 
@@ -61,6 +59,18 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 - **新增日志输出开关**：可在 UI 中开启/关闭控制台日志输出，方便排查问题
 - **新增预览数量上限配置**：控制注入 AI 提示中的表情列表条数上限，避免 token 浪费
 - **UI 配置面板完善**：新增「表情包列表更新」「表情包显示上限」「调试设置」配置区块
+
+
+## v1.3.0 主要更新
+
+- **新增在线搜图功能**：AI 可用 `SearchBqbOnline` 搜索 ChineseBQB 在线表情包库（数万张表情包），搜到后用 `SaveImage` 下载到本地再用 `<qimage>` 发送
+- **完整闭环流程**：`SearchBqbOnline`（搜索，返回名称+URL）→ `SaveImage`（下载到本地）→ `<qimage>`（发送），复用现有基础设施
+- **数据源切换**：支持镜像源（jsDelivr CDN，国内推荐）和 GitHub 源（raw.githubusercontent.com），默认镜像源，可在 UI 中切换
+- **修复索引下载失败**：使用专用 HttpClient（无 QQ Referer 头）+ `GetByteArrayAsync` + 自动重试，解决代理环境下 "Error while copying content to a stream" 问题
+- **手动下载指引**：UI 中提供索引文件下载链接和保存路径，自动下载失败时用户可手动下载放到本地
+- **多关键词搜索**：支持空格分隔多个关键词，AND 匹配文件名和分类
+- **本地缓存机制**：在线索引下载后缓存到本地，可配置缓存有效期，过期自动刷新
+- **可配置项**：启用开关、数据源选择、缓存天数、搜索结果数量、搜图日志开关
 
 ## 配置项
 
@@ -78,12 +88,18 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 | 更新阈值 | 5 个图 | 存满 N 个图触发一次列表更新 |
 | 预览上限 | 50 条 | 注入提示的表情列表条数上限，0=不限制 |
 | 日志输出 | 关 | 在运行窗口显示插件运行日志 |
+| 启用在线搜图 | 关 | 开启后 AI 可搜索 ChineseBQB 在线表情包库 |
+| 数据源 | 镜像源 | 镜像源（jsDelivr CDN，国内推荐）/ GitHub源（需网络通畅） |
+| 缓存天数 | 7天 | 在线索引缓存有效期，过期自动刷新 |
+| 搜索结果数量 | 5条 | 每次搜索返回的最大结果条数 |
+| 搜图日志 | 关 | 在运行窗口显示在线搜图相关日志 |
 
 ## AI 可用函数
 
 ```
 <SaveImage name="文件名.后缀">图片URL</SaveImage>    存图
 <ListEmojis />                                         查看可用表情
+<SearchBqbOnline keyword="关键词" />                   搜索在线表情包
 ```
 
 ### 发图格式
@@ -96,14 +112,23 @@ AI 根据对话场景选择：
 - 私聊 → `type="Private"`，`targetid` 为对方 QQ 号
 - 群聊 → `type="Group"`，`targetid` 为群号
 
+### 在线搜图流程
+
+```
+SearchBqbOnline（搜索，返回名称+URL）
+    ↓
+SaveImage（用返回的URL下载到本地）
+    ↓
+<qimage>（发送本地图片）
+```
+
+AI 搜索 ChineseBQB 在线表情包库后，从结果中选一个，用 `SaveImage` 下载到本地表情库，再用 `<qimage>` 发出。图片 URL 根据数据源设置使用镜像源（jsDelivr CDN）或 GitHub 原始地址。
+
+若自动下载失败，可在 UI 中找到索引文件下载链接，手动下载后保存为 `{表情包目录}/chinesebqb_index.json` 即可。
+
 ## 安装
 
 直接在 Alife 插件市场中下载；或将 `Alife.Plugin.QQEmoji` 文件夹放入 Alife 的 `Storage/Plugins` 目录，在客户端重载模块即可。
-
-## 致谢
-
-感谢 **周武** **爱奈丽** 提供的 EmoteStealerService.cs 参考。
-
 
 ## 致谢
 
