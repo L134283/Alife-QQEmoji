@@ -5,8 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
 using Alife.Function.FunctionCaller;
@@ -59,7 +59,6 @@ public record QQEmojiConfig
         ["哈哈"] = 25, ["笑死"] = 30, ["好笑"] = 20, ["好耶"] = 20,
         ["开心"] = 20, ["可爱"] = 15, ["棒"] = 15, ["赞"] = 10,
         ["哭"] = 15, ["难受"] = 15, ["呜呜"] = 20, ["绷不住"] = 25,
-        ["?"] = 5, ["!"] = 5,
     };
 
     public bool EnableAutoUpdateEmojiList { get; set; } = true;
@@ -69,9 +68,11 @@ public record QQEmojiConfig
 
     public bool EnableOnlineSearch { get; set; } = false;
     public bool EnableOnlineSearchLog { get; set; } = false;
-    public int SearchCacheDays { get; set; } = 7;
     public int SearchResultCount { get; set; } = 5;
     public bool BqbUseCdn { get; set; } = true;
+
+    // true=自动下载到表情包目录（永久），false=缓存到临时目录（5小时清理）
+    public bool EnableOnlineImageCache { get; set; } = false;
 }
 
 [Module("QQ表情包管家",
@@ -85,7 +86,6 @@ public class QQEmoji(
 {
     public QQEmojiConfig? Configuration { get; set; }
     static readonly HttpClient _http = new();
-    static readonly HttpClient _bqbHttp = new() { Timeout = TimeSpan.FromMinutes(2) };
 
     DateTime _lastSendTime = DateTime.MinValue;
     int _burstCount;
@@ -93,21 +93,35 @@ public class QQEmoji(
     int _saveCountSinceLastListUpdate;
 
     List<BqbEntry> _bqbIndex = new();
-    DateTime _bqbIndexLoadTime = DateTime.MinValue;
+    readonly object _bqbLock = new();
+    readonly HashSet<string> _downloadedSet = new(StringComparer.OrdinalIgnoreCase);
+    static DateTime _lastCacheClean = DateTime.MinValue;
 
-    const string BQB_INDEX_URL_CDN = "https://cdn.jsdelivr.net/gh/zhaoolee/ChineseBQB@master/chinesebqb_github.json";
-    const string BQB_INDEX_URL_RAW = "https://raw.githubusercontent.com/zhaoolee/ChineseBQB/master/chinesebqb_github.json";
     const string BQB_RAW_PREFIX = "https://raw.githubusercontent.com/zhaoolee/ChineseBQB/master/";
     const string BQB_CDN_PREFIX = "https://cdn.jsdelivr.net/gh/zhaoolee/ChineseBQB@master/";
-
-    static string GetBqbIndexUrl(QQEmojiConfig cfg) => cfg.BqbUseCdn ? BQB_INDEX_URL_CDN : BQB_INDEX_URL_RAW;
+    const string PluginId = "Alife.Plugin.QQEmoji";
+    const string BqbIndexFileName = "chinesebqb_index.json";
+    const string CacheSubDir = ".online_cache";
+    const int MaxImageBytes = 10 * 1024 * 1024;
+    static readonly TimeSpan CacheTtl = TimeSpan.FromHours(5);
 
     static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
 
     static readonly string[] _imageExts = { ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp" };
 
-    void Log(string msg)
+    void LogOnline(string msg)
     {
+        var cfg = Configuration;
+        if (cfg == null || !cfg.EnableOnlineSearchLog)
+            return;
+        Console.WriteLine($"[QQEmoji] {msg}");
+    }
+
+    void LogGeneral(string msg)
+    {
+        var cfg = Configuration;
+        if (cfg != null && !cfg.EnableLogging)
+            return;
         Console.WriteLine($"[QQEmoji] {msg}");
     }
 
@@ -116,9 +130,13 @@ public class QQEmoji(
         _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://qq.com");
-        _bqbHttp.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
     }
+
+    static string GetBuiltinIndexPath() =>
+        Path.Combine(AlifePath.StorageFolderPath, "Plugins", PluginId, BqbIndexFileName);
+
+    static string GetTempCachePath(QQEmojiConfig cfg) =>
+        Path.Combine(cfg.EmojiPath, CacheSubDir);
 
     public override async Task AwakeAsync(AwakeContext context)
     {
@@ -148,11 +166,45 @@ public class QQEmoji(
 
         if (cfg.EnableOnlineSearch)
         {
-            Prompt("【搜在线表情包】若本地没有符合当前语境的，可调用 SearchBqbOnline 搜在线图（关键词5字内，可用空格分隔多个词）。搜到结果后从中选一个，用 SaveImage 下载到本地，再用 <qimage> 发出。");
-            _ = RefreshBqbCacheAsync(cfg);
+            await LoadBqbIndexAsync(cfg);
+
+            if (cfg.EnableOnlineImageCache)
+            {
+                Prompt($@"【在线表情包】SearchBqbOnline 搜在线图（关键词5字内）。
+从结果中选一张：若标注[已在库中]则直接用 <qimage> 发出；否则用 <DownloadToCache url=""URL"" name=""文件名"" /> 下载后再发。");
+            }
+            else
+            {
+                Prompt($@"【在线表情包】SearchBqbOnline 搜在线图（关键词5字内）。
+从结果中选一张：若标注[已缓存]则直接用 <qimage> 发出；否则用 <DownloadToCache url=""URL"" name=""文件名"" /> 下载到缓存后再发。
+缓存目录 {GetTempCachePath(cfg)}，每 5 小时和启动时自动清理。");
+                CleanTempCache(cfg);
+            }
         }
 
-        Log($"启动完成，表情包目录：{cfg.EmojiPath}，当前共 {GetImageFiles(cfg.EmojiPath).Count} 个文件");
+        LogGeneral($"启动完成，表情包目录：{cfg.EmojiPath}，当前共 {GetImageFiles(cfg.EmojiPath).Count} 个文件");
+    }
+
+    static void CleanTempCache(QQEmojiConfig cfg)
+    {
+        var cacheDir = GetTempCachePath(cfg);
+        if (!Directory.Exists(cacheDir)) return;
+
+        try
+        {
+            var threshold = DateTime.UtcNow - CacheTtl;
+            foreach (var file in Directory.GetFiles(cacheDir))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(file) < threshold)
+                        File.Delete(file);
+                }
+                catch { }
+            }
+        }
+        catch { }
+        _lastCacheClean = DateTime.UtcNow;
     }
 
     public override async Task StartAsync(Kernel kernel, ChatActivity chatActivity)
@@ -169,7 +221,6 @@ public class QQEmoji(
         return base.DestroyAsync();
     }
 
-    // AI 回复前预处理：检测 QQ 聊天消息，决策是否触发，在消息末尾注入提示让 AI 自主选表情包
     string OnChatSend(string msg)
     {
         if (!msg.Contains("消息来源:[QChatService]")) return msg;
@@ -183,13 +234,13 @@ public class QQEmoji(
             if (elapsed >= cfg.CooldownSeconds)
             {
                 if (_burstCount != 0)
-                    Log($"爆率计数器复位，距上次发送 {elapsed:F1} 秒");
+                    LogGeneral($"爆率计数器复位，距上次发送 {elapsed:F1} 秒");
                 _burstCount = 0;
             }
         }
 
         var decision = Decide(msg, cfg);
-        Log($"决策结果：{decision.ShouldSend}，原因：{decision.Reason}");
+        LogGeneral($"决策结果：{decision.ShouldSend}，原因：{decision.Reason}");
         if (!decision.ShouldSend) return msg;
 
         lock (_stateLock)
@@ -198,10 +249,17 @@ public class QQEmoji(
             _burstCount++;
         }
 
-        Log("已向消息注入表情包提示");
+        LogGeneral("已向消息注入表情包提示");
         if (cfg.EnableOnlineSearch)
         {
-            return msg + "\n\n[系统提示：可以选个表情包附末尾。若列表没有符合当前语境的表情包，可用 SearchBqbOnline 搜在线表情包（关键词5字内），搜到后用 SaveImage 下载到本地再用 <qimage> 发出。\n若下一轮没有此提示，则说明系统未允许发表情包，不发送表情包]";
+            if (cfg.EnableOnlineImageCache)
+            {
+                return msg + $"\n\n[系统提示：可以选个表情包附末尾。若列表没有符合当前语境的，可用 SearchBqbOnline 搜在线表情包（关键词5字内），搜到后从结果中选一张，用 <DownloadToCache url=\"URL\" name=\"文件名\" /> 下载再到 <qimage> 发送。\n若下一轮没有此提示，则说明系统未允许发表情包，不发送表情包]";
+            }
+            else
+            {
+                return msg + "\n\n[系统提示：可以选个表情包附末尾。若列表没有符合当前语境的，可用 SearchBqbOnline 搜在线表情包（关键词5字内），搜到后从结果中选一张，用 <DownloadToCache url=\"URL\" name=\"文件名\" /> 下载再到 <qimage> 发送。\n若下一轮没有此提示，则说明系统未允许发表情包，不发送表情包]";
+            }
         }
         else
         {
@@ -267,12 +325,26 @@ public class QQEmoji(
             var cfg = Configuration;
             if (cfg == null) return;
 
+            if (string.IsNullOrWhiteSpace(source) ||
+                !Uri.TryCreate(source.Trim(), UriKind.Absolute, out var uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            {
+                Poke("❌ 保存失败: 无效的图片 URL");
+                return;
+            }
+
             var dir = cfg.EmojiPath;
             Directory.CreateDirectory(dir);
 
-            // 防路径穿越
             name = Path.GetFileName(name);
             if (string.IsNullOrEmpty(name)) return;
+
+            var ext = Path.GetExtension(name).ToLowerInvariant();
+            if (!_imageExts.Contains(ext))
+            {
+                Poke("❌ 保存失败: 不支持的图片后缀");
+                return;
+            }
 
             var dest = Path.Combine(dir, name);
 
@@ -287,25 +359,50 @@ public class QQEmoji(
                 }
             }
 
-            var bytes = await _http.GetByteArrayAsync(source);
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+            using var response = await _http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            response.EnsureSuccessStatusCode();
+
+            var contentLength = response.Content.Headers.ContentLength;
+            if (contentLength is > MaxImageBytes)
+            {
+                Poke($"❌ 保存失败: 图片过大（>{MaxImageBytes / 1024 / 1024}MB）");
+                return;
+            }
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(cts.Token);
+            if (bytes.Length == 0)
+            {
+                Poke("❌ 保存失败: 图片内容为空");
+                return;
+            }
+            if (bytes.Length > MaxImageBytes)
+            {
+                Poke($"❌ 保存失败: 图片过大（>{MaxImageBytes / 1024 / 1024}MB）");
+                return;
+            }
+
             await File.WriteAllBytesAsync(dest, bytes);
 
             Poke($"✅ 已保存: {Path.GetFileName(dest)}");
-            Log($"图片已保存：{Path.GetFileName(dest)}（{bytes.Length} bytes）");
+            LogGeneral($"图片已保存：{Path.GetFileName(dest)}（{bytes.Length} bytes）");
 
-            // 存图后自动更新表情包列表
             if (cfg.EnableAutoUpdateEmojiList)
             {
                 _saveCountSinceLastListUpdate++;
-                Log($"存图计数器：{_saveCountSinceLastListUpdate}/{cfg.AutoUpdateThreshold}");
+                LogGeneral($"存图计数器：{_saveCountSinceLastListUpdate}/{cfg.AutoUpdateThreshold}");
                 if (_saveCountSinceLastListUpdate >= cfg.AutoUpdateThreshold)
                 {
                     _saveCountSinceLastListUpdate = 0;
                     string newList = BuildEmojiListString(dir, cfg.MaxEmojiListPreview);
                     Prompt($"📢 表情包列表已更新（存了 {cfg.AutoUpdateThreshold} 个新图后自动刷新）：\n{newList}");
-                    Log($"已达阈值 {cfg.AutoUpdateThreshold}，已向 AI 推送最新表情包列表");
+                    LogGeneral($"已达阈值 {cfg.AutoUpdateThreshold}，已向 AI 推送最新表情包列表");
                 }
             }
+        }
+        catch (OperationCanceledException)
+        {
+            Poke("❌ 保存失败: 下载超时（超过 1 分钟），请稍后重试");
         }
         catch (Exception ex)
         {
@@ -344,82 +441,32 @@ public class QQEmoji(
 
     // ===== 在线搜图 =====
 
-    async Task RefreshBqbCacheAsync(QQEmojiConfig cfg)
+    async Task LoadBqbIndexAsync(QQEmojiConfig cfg)
     {
-        try
+        string indexPath = GetBuiltinIndexPath();
+        if (!File.Exists(indexPath))
         {
-            string cachePath = Path.Combine(cfg.EmojiPath, "chinesebqb_index.json");
-            bool needDownload = true;
-
-            if (File.Exists(cachePath))
-            {
-                var lastWrite = File.GetLastWriteTimeUtc(cachePath);
-                if ((DateTime.UtcNow - lastWrite).TotalDays < cfg.SearchCacheDays)
-                    needDownload = false;
-            }
-
-            if (needDownload)
-            {
-                if (cfg.EnableOnlineSearchLog)
-                    Log("正在更新在线表情包索引...");
-                string json = null!;
-                for (int attempt = 0; attempt < 2; attempt++)
-                {
-                    try
-                    {
-                        var bytes = await _bqbHttp.GetByteArrayAsync(GetBqbIndexUrl(cfg));
-                        json = Encoding.UTF8.GetString(bytes);
-                        break;
-                    }
-                    catch (Exception ex) when (attempt == 0)
-                    {
-                        if (cfg.EnableOnlineSearchLog)
-                            Log($"索引下载第1次失败，重试中... ({ex.Message})");
-                        await Task.Delay(2000);
-                    }
-                }
-                if (json != null)
-                {
-                    Directory.CreateDirectory(cfg.EmojiPath);
-                    await File.WriteAllTextAsync(cachePath, json);
-                    if (cfg.EnableOnlineSearchLog)
-                        Log("在线表情包索引已更新");
-                }
-                else
-                {
-                    if (cfg.EnableOnlineSearchLog)
-                        Log("在线表情包索引下载失败，尝试使用已有缓存");
-                }
-            }
-
-            await LoadBqbIndexAsync(cachePath, cfg);
-        }
-        catch (Exception ex)
-        {
-            if (cfg.EnableOnlineSearchLog)
-                Log($"在线表情包索引更新失败: {ex.Message}");
-            string cachePath = Path.Combine(cfg.EmojiPath, "chinesebqb_index.json");
-            if (File.Exists(cachePath))
-                await LoadBqbIndexAsync(cachePath, cfg);
-        }
-    }
-
-    async Task LoadBqbIndexAsync(string cachePath, QQEmojiConfig cfg)
-    {
-        if (!File.Exists(cachePath))
-        {
-            _bqbIndex = new List<BqbEntry>();
+            lock (_bqbLock) { _bqbIndex = new List<BqbEntry>(); }
+            LogOnline($"内置索引不存在：{indexPath}");
             return;
         }
 
-        var json = await File.ReadAllTextAsync(cachePath);
-        var root = JsonSerializer.Deserialize<BqbRoot>(json, _jsonOpts);
-        _bqbIndex = root?.Data?
-            .Where(e => _imageExts.Contains(Path.GetExtension(e.Name).ToLower()))
-            .ToList() ?? new List<BqbEntry>();
-        _bqbIndexLoadTime = DateTime.UtcNow;
-        if (cfg.EnableOnlineSearchLog)
-            Log($"在线表情包索引已加载（{_bqbIndex.Count} 条）");
+        try
+        {
+            var json = await File.ReadAllTextAsync(indexPath);
+            var root = JsonSerializer.Deserialize<BqbRoot>(json, _jsonOpts);
+            var list = root?.Data?
+                .Where(e => _imageExts.Contains(Path.GetExtension(e.Name).ToLowerInvariant()))
+                .ToList() ?? new List<BqbEntry>();
+
+            lock (_bqbLock) { _bqbIndex = list; }
+            LogOnline($"内置表情包索引已加载（{list.Count} 条）");
+        }
+        catch (Exception ex)
+        {
+            lock (_bqbLock) { _bqbIndex = new List<BqbEntry>(); }
+            LogOnline($"内置索引加载失败: {ex.Message}");
+        }
     }
 
     static string ConvertBqbUrl(string rawUrl, QQEmojiConfig cfg)
@@ -430,7 +477,75 @@ public class QQEmoji(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("用关键词搜索 ChineseBQB 在线表情包库，返回结果（含名称和URL）。从结果中选一个后用 SaveImage 下载到本地，再用 <qimage> 发出。")]
+    [Description("从在线搜索结果中下载指定图片到本地，返回本地路径。下载成功后直接用 <qimage> 发送。")]
+    public async Task DownloadToCache(
+        [Description("图片下载地址（来自 SearchBqbOnline 返回的 URL）")] string url,
+        [Description("保存的文件名（来自 SearchBqbOnline 返回的名称）")] string name)
+    {
+        var cfg = Configuration;
+        if (cfg == null) return;
+
+        if (string.IsNullOrWhiteSpace(url) ||
+            !Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            Poke("❌ 下载失败: 无效的图片 URL");
+            return;
+        }
+
+        name = Path.GetFileName(name);
+        if (string.IsNullOrEmpty(name)) return;
+
+        var ext = Path.GetExtension(name).ToLowerInvariant();
+        if (!_imageExts.Contains(ext)) return;
+
+        // 开关 ON → 存到表情包目录；开关 OFF → 存到缓存目录
+        var targetDir = cfg.EnableOnlineImageCache ? cfg.EmojiPath : GetTempCachePath(cfg);
+        Directory.CreateDirectory(targetDir);
+
+        var dest = Path.Combine(targetDir, name);
+        if (File.Exists(dest))
+        {
+            Poke($"✅ 已存在: {dest}");
+            return;
+        }
+
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+            using var response = await _http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            response.EnsureSuccessStatusCode();
+
+            var contentLength = response.Content.Headers.ContentLength;
+            if (contentLength is > MaxImageBytes)
+            {
+                Poke($"❌ 下载失败: 图片过大（>{MaxImageBytes / 1024 / 1024}MB）");
+                return;
+            }
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(cts.Token);
+            if (bytes.Length == 0 || bytes.Length > MaxImageBytes)
+            {
+                Poke("❌ 下载失败: 图片内容为空或过大");
+                return;
+            }
+
+            await File.WriteAllBytesAsync(dest, bytes);
+            Poke($"✅ 已缓存: {dest}");
+            LogOnline($"DownloadToCache 成功：{name} → {dest}");
+        }
+        catch (OperationCanceledException)
+        {
+            Poke("❌ 下载超时，请稍后重试或换一张图");
+        }
+        catch (Exception ex)
+        {
+            Poke($"❌ 下载失败: {ex.Message}");
+        }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("搜索 ChineseBQB 在线表情包库。返回结果含名称和下载URL。从中选一张后用 DownloadToCache 下载到本地，再用 <qimage> 发出。若标注[已缓存]则无需再次下载。")]
     public void SearchBqbOnline(
         [Description("搜索关键词（精简到5字以内，可用空格分隔多个关键词）")] string keyword)
     {
@@ -441,31 +556,41 @@ public class QQEmoji(
             return;
         }
 
-        if (_bqbIndex.Count == 0)
+        List<BqbEntry> index;
+        lock (_bqbLock) { index = _bqbIndex; }
+
+        if (index.Count == 0)
         {
-            string cachePath = Path.Combine(cfg.EmojiPath, "chinesebqb_index.json");
-            if (File.Exists(cachePath))
+            string indexPath = GetBuiltinIndexPath();
+            if (File.Exists(indexPath))
             {
                 try
                 {
-                    var json = File.ReadAllText(cachePath);
+                    var json = File.ReadAllText(indexPath);
                     var root = JsonSerializer.Deserialize<BqbRoot>(json, _jsonOpts);
-                    _bqbIndex = root?.Data?
-                        .Where(e => _imageExts.Contains(Path.GetExtension(e.Name).ToLower()))
+                    index = root?.Data?
+                        .Where(e => _imageExts.Contains(Path.GetExtension(e.Name).ToLowerInvariant()))
                         .ToList() ?? new List<BqbEntry>();
+                    lock (_bqbLock) { _bqbIndex = index; }
                 }
                 catch { }
             }
         }
 
-        if (_bqbIndex.Count == 0)
+        if (index.Count == 0)
         {
             Poke("在线表情包索引未就绪，用本地库的就好");
             return;
         }
 
+        if (string.IsNullOrWhiteSpace(keyword))
+        {
+            Poke("请提供搜索关键词");
+            return;
+        }
+
         var keywords = keyword.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        var results = _bqbIndex
+        var results = index
             .Where(e => keywords.All(k =>
                 e.Name.Contains(k, StringComparison.OrdinalIgnoreCase) ||
                 e.Category.Contains(k, StringComparison.OrdinalIgnoreCase)))
@@ -478,23 +603,168 @@ public class QQEmoji(
             return;
         }
 
-        var lines = results.Select((r, i) =>
-            $"{i + 1}. {r.Name}\n   {ConvertBqbUrl(r.Url, cfg)}");
-        string pokeMsg = $"搜到{results.Count}个：\n{string.Join("\n", lines)}\n" +
-            $"选一个后用 <SaveImage name=\"文件名.后缀\" source=\"上面选的URL\" /> 下载到本地，再用 <qimage> 发出";
+        var lines = new List<string>(results.Count);
+        for (int i = 0; i < results.Count; i++)
+        {
+            var r = results[i];
+            var url = ConvertBqbUrl(r.Url, cfg);
+            var line = $"{i + 1}. {r.Name}\n   {url}";
+
+            if (cfg.EnableOnlineImageCache)
+            {
+                var localPath = Path.Combine(cfg.EmojiPath, r.Name);
+                if (File.Exists(localPath))
+                    line += $"\n   [已在库中] {localPath}";
+            }
+            else
+            {
+                var cachedPath = Path.Combine(GetTempCachePath(cfg), r.Name);
+                if (File.Exists(cachedPath))
+                    line += $"\n   [已缓存] {cachedPath}";
+            }
+
+            lines.Add(line);
+        }
+
+        string pokeMsg;
+        if (cfg.EnableOnlineImageCache)
+        {
+            pokeMsg = $"搜到{results.Count}个：\n{string.Join("\n", lines)}\n" +
+                $"从上面选一张，若标注[已在库中]则直接用 <qimage> 发出；否则用 <DownloadToCache url=\"选中的URL\" name=\"选中的文件名\" /> 下载后发送。";
+        }
+        else
+        {
+            pokeMsg = $"搜到{results.Count}个：\n{string.Join("\n", lines)}\n" +
+                $"从上面选一张，若标注[已缓存]则直接用 <qimage> 发出；否则用 <DownloadToCache url=\"选中的URL\" name=\"选中的文件名\" /> 下载后，再用 <qimage> 发送缓存返回的路径。";
+        }
 
         Poke(pokeMsg);
+        LogOnline($"在线搜图「{keyword}」→ {results.Count} 个结果");
 
-        if (cfg.EnableOnlineSearchLog)
-            Log($"在线搜图「{keyword}」→ {results.Count} 个结果");
+        // 开关 ON 时后台预下载全部到表情包目录，加速下次使用
+        if (cfg.EnableOnlineImageCache)
+        {
+            #pragma warning disable CS4014
+            Task.Run(async () => await DownloadToEmojiPathAsync(results, cfg));
+            #pragma warning restore CS4014
+        }
+        else
+        {
+            if (DateTime.UtcNow - _lastCacheClean > CacheTtl)
+                CleanTempCache(cfg);
+        }
+    }
+
+    // 自动下载到表情包目录（永久）
+    async Task DownloadToEmojiPathAsync(List<BqbEntry> results, QQEmojiConfig cfg)
+    {
+        try
+        {
+            var dir = cfg.EmojiPath;
+            Directory.CreateDirectory(dir);
+            var sem = new System.Threading.SemaphoreSlim(3);
+
+            var tasks = results.Select(async r =>
+            {
+                var name = Path.GetFileName(r.Name);
+                if (string.IsNullOrEmpty(name)) return;
+                var ext = Path.GetExtension(name).ToLowerInvariant();
+                if (!_imageExts.Contains(ext)) return;
+
+                var dest = Path.Combine(dir, name);
+                lock (_downloadedSet) { if (_downloadedSet.Contains(name)) return; }
+
+                await sem.WaitAsync();
+                try
+                {
+                    if (File.Exists(dest)) return;
+
+                    var url = ConvertBqbUrl(r.Url, cfg);
+                    if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+                        (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                        return;
+
+                    using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+                    using var response = await _http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                    if (!response.IsSuccessStatusCode) return;
+
+                    var contentLength = response.Content.Headers.ContentLength;
+                    if (contentLength is > MaxImageBytes) return;
+
+                    var bytes = await response.Content.ReadAsByteArrayAsync(cts.Token);
+                    if (bytes.Length == 0 || bytes.Length > MaxImageBytes) return;
+
+                    await File.WriteAllBytesAsync(dest, bytes);
+                    lock (_downloadedSet) { _downloadedSet.Add(name); }
+                    LogOnline($"已下载到表情包目录：{name}");
+                }
+                catch { }
+                finally { sem.Release(); }
+            });
+
+            await Task.WhenAll(tasks);
+        }
+        catch { }
+    }
+
+    // 下载到临时缓存（5小时清理）
+    async Task DownloadToCacheAsync(List<BqbEntry> results, QQEmojiConfig cfg)
+    {
+        try
+        {
+            var cacheDir = GetTempCachePath(cfg);
+            Directory.CreateDirectory(cacheDir);
+            var sem = new System.Threading.SemaphoreSlim(3);
+
+            var tasks = results.Select(async r =>
+            {
+                var name = Path.GetFileName(r.Name);
+                if (string.IsNullOrEmpty(name)) return;
+                var ext = Path.GetExtension(name).ToLowerInvariant();
+                if (!_imageExts.Contains(ext)) return;
+
+                var dest = Path.Combine(cacheDir, name);
+                if (File.Exists(dest)) return;
+
+                await sem.WaitAsync();
+                try
+                {
+                    var url = ConvertBqbUrl(r.Url, cfg);
+                    if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+                        (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                        return;
+
+                    using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+                    using var response = await _http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                    if (!response.IsSuccessStatusCode) return;
+
+                    var contentLength = response.Content.Headers.ContentLength;
+                    if (contentLength is > MaxImageBytes) return;
+
+                    var bytes = await response.Content.ReadAsByteArrayAsync(cts.Token);
+                    if (bytes.Length == 0 || bytes.Length > MaxImageBytes) return;
+
+                    await File.WriteAllBytesAsync(dest, bytes);
+                    LogOnline($"已缓存：{name}");
+                }
+                catch { }
+                finally { sem.Release(); }
+            });
+
+            await Task.WhenAll(tasks);
+        }
+        catch { }
     }
 
     // ===== 工具方法 =====
 
     static List<string> GetImageFiles(string dir)
     {
+        if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
+            return new List<string>();
+
         return Directory.GetFiles(dir)
-            .Where(f => _imageExts.Contains(Path.GetExtension(f).ToLower()))
+            .Where(f => _imageExts.Contains(Path.GetExtension(f).ToLowerInvariant()))
             .ToList();
     }
 
@@ -509,7 +779,7 @@ public class QQEmoji(
 
         if (files.Count == 0) return "(空)";
 
-        Log($"扫描目录：共 {files.Count} 个表情包，预览上限 {maxPreview}");
+        LogGeneral($"扫描目录：共 {files.Count} 个表情包，预览上限 {maxPreview}");
 
         var lines = maxPreview > 0 ? files.Take(maxPreview).Select(f => $"  - {f}")
                                    : files.Select(f => $"  - {f}");
