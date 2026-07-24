@@ -2,10 +2,11 @@
   "id": "Alife.Plugin.QQEmoji",
   "name": "QQ表情包管家",
   "author": "doro",
-  "description": "AI按策略和当下聊天内容自动附带表情包，支持情绪关键词加权、冷却防刷屏。对AI说「存为xxx」即可保存图片到自定义路径。支持在线搜图（内置 ChineseBQB 索引）。感谢爱奈丽提供的插件参考",
+  "description": "AI按策略和当下聊天内容自动附带表情包，支持情绪关键词加权、冷却防刷屏。对AI说「存为xxx」即可保存图片到自定义路径。支持在线搜图（内置 ChineseBQB 索引）与腾讯实时表情一键直发。感谢爱奈丽提供的插件参考",
 
   "dependencies": {
-    "Alife.Function.FunctionCaller": ""
+    "Alife.Function.FunctionCaller": "",
+    "Alife.Function.QChat": ""
   },
 
   "environments": {
@@ -18,6 +19,11 @@
   ],
 
   "releases": {
+    "1.5.0": {
+      "date": "2026-07-24",
+      "note": "新增腾讯/搜狗实时表情源（推荐默认开启）：AI 只需 SendTencentEmoji 传关键词，插件自动搜索并同轮调用 qimage 直发；可选自动保存到本地库；会话目标动态解析；表情包目录不存在时自动创建；与 ChineseBQB 双源并存",
+      "file": "https://github.com/L134283/Alife-QQEmoji/releases/download/QQEmoji-v1.5.0/Alife.Plugin.QQEmoji.zip"
+    },
     "1.4.0": {
       "date": "2026-07-23",
       "note": "在线搜图改为仅用内置索引；新增搜索自动下载图片到表情包目录（可开关，开启时永久保存可直接发；关闭时临时缓存5h自动清理）；日志开关正经门控；SaveImage增加URL/后缀/大小校验；UI大改为暗色全息玻璃+卡牌网格自动铺满；开关与配置项就近配对；移除?/!误触发情绪词",

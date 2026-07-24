@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
@@ -73,6 +74,31 @@ public record QQEmojiConfig
 
     // true=自动下载到表情包目录（永久），false=缓存到临时目录（5小时清理）
     public bool EnableOnlineImageCache { get; set; } = false;
+
+    /// <summary>启用腾讯/搜狗实时表情搜索，AI 只传关键词即可同轮直发（推荐，默认开启）。</summary>
+    public bool EnableTencentSearch { get; set; } = true;
+
+    /// <summary>腾讯表情发送成功后，是否顺便下载保存到本地表情包库。</summary>
+    public bool EnableTencentAutoSave { get; set; } = false;
+}
+
+public class TencentEmojiItem
+{
+    public string IndexUrl { get; set; } = "";
+    public string Format { get; set; } = "";
+    public string ImageId { get; set; } = "";
+    public int RealHeight { get; set; }
+    public int RealWidth { get; set; }
+    public long FileSize { get; set; }
+}
+
+public class TencentEmojiResponse
+{
+    public int Code { get; set; }
+    public string Msg { get; set; } = "";
+    public List<TencentEmojiItem>? Data { get; set; }
+    public int HasMore { get; set; }
+    public bool EndFlag { get; set; }
 }
 
 [Module("QQ表情包管家",
@@ -97,13 +123,42 @@ public class QQEmoji(
     readonly HashSet<string> _downloadedSet = new(StringComparer.OrdinalIgnoreCase);
     static DateTime _lastCacheClean = DateTime.MinValue;
 
+    // 最近一次从入站 qchat 解析出的会话目标（动态，不写死任何号）
+    string? _lastChatType;
+    string? _lastTargetId;
+    readonly object _chatTargetLock = new();
+
     const string BQB_RAW_PREFIX = "https://raw.githubusercontent.com/zhaoolee/ChineseBQB/master/";
     const string BQB_CDN_PREFIX = "https://cdn.jsdelivr.net/gh/zhaoolee/ChineseBQB@master/";
+    const string TencentSearchApi = "https://h5api.sginput.qq.com/wxbq/search";
     const string PluginId = "Alife.Plugin.QQEmoji";
     const string BqbIndexFileName = "chinesebqb_index.json";
     const string CacheSubDir = ".online_cache";
     const int MaxImageBytes = 10 * 1024 * 1024;
     static readonly TimeSpan CacheTtl = TimeSpan.FromHours(5);
+    // 兼容 AI 出站/文档中的 qchat 标签（属性顺序两种）
+    static readonly Regex QChatTagRegex = new(
+        @"<qchat\b[^>]*\btype\s*=\s*""(?<type>Private|Group)""[^>]*\btargetid\s*=\s*""(?<id>\d+)""",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    static readonly Regex QChatTagRegexAlt = new(
+        @"<qchat\b[^>]*\btargetid\s*=\s*""(?<id>\d+)""[^>]*\btype\s*=\s*""(?<type>Private|Group)""",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // QChat 入站实际格式（见 OneBotSegment / QChatService）
+    // 群缓冲：> 以下是群 [123456(群名)] 的消息
+    static readonly Regex GroupBufferRegex = new(
+        @"以下是群\s*\[(?<id>\d+)",
+        RegexOptions.Compiled);
+    // 群单条来源：[群聊 123456(群名), 发言人 ...]
+    static readonly Regex GroupChatSourceRegex = new(
+        @"\[群聊\s+(?<id>\d+)",
+        RegexOptions.Compiled);
+    // 私聊：[私聊][123456(昵称)]: 或 [私聊 123456(昵称)]
+    static readonly Regex PrivateSpeakerRegex = new(
+        @"\[私聊\]\[(?<id>\d+)",
+        RegexOptions.Compiled);
+    static readonly Regex PrivateSourceRegex = new(
+        @"\[私聊\s+(?<id>\d+)",
+        RegexOptions.Compiled);
 
     static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
 
@@ -146,6 +201,7 @@ public class QQEmoji(
         functionService.RegisterHandler(handler);
 
         var cfg = Configuration ?? new QQEmojiConfig();
+        EnsureEmojiPath(cfg);
         string emojiList = BuildEmojiListString(cfg.EmojiPath, cfg.MaxEmojiListPreview);
 
         Prompt($$"""
@@ -170,16 +226,26 @@ public class QQEmoji(
 
             if (cfg.EnableOnlineImageCache)
             {
-                Prompt($@"【在线表情包】SearchBqbOnline 搜在线图（关键词5字内）。
+                Prompt($@"【在线表情包·BQB】SearchBqbOnline 搜内置索引（关键词5字内）。
 从结果中选一张：若标注[已在库中]则直接用 <qimage> 发出；否则用 <DownloadToCache url=""URL"" name=""文件名"" /> 下载后再发。");
             }
             else
             {
-                Prompt($@"【在线表情包】SearchBqbOnline 搜在线图（关键词5字内）。
+                Prompt($@"【在线表情包·BQB】SearchBqbOnline 搜内置索引（关键词5字内）。
 从结果中选一张：若标注[已缓存]则直接用 <qimage> 发出；否则用 <DownloadToCache url=""URL"" name=""文件名"" /> 下载到缓存后再发。
 缓存目录 {GetTempCachePath(cfg)}，每 5 小时和启动时自动清理。");
                 CleanTempCache(cfg);
             }
+        }
+
+        if (cfg.EnableTencentSearch)
+        {
+            Prompt("""
+                【在线表情包·腾讯】需要在线表情时，只调用一次：
+                <SendTencentEmoji keyword="关键词" />
+                插件会自动搜索并直接发出图片，你无需再写 <qimage>，也不要第二轮补发。
+                若函数反馈失败，请改用本地表情包库已有文件发 <qimage>。
+                """);
         }
 
         LogGeneral($"启动完成，表情包目录：{cfg.EmojiPath}，当前共 {GetImageFiles(cfg.EmojiPath).Count} 个文件");
@@ -225,6 +291,9 @@ public class QQEmoji(
     {
         if (!msg.Contains("消息来源:[QChatService]")) return msg;
 
+        // 始终尝试解析当次会话目标，供腾讯源同轮直发使用
+        TryParseChatTarget(msg);
+
         var cfg = Configuration;
         if (cfg == null) return msg;
 
@@ -250,20 +319,76 @@ public class QQEmoji(
         }
 
         LogGeneral("已向消息注入表情包提示");
+
+        var tips = new List<string> { "可以选个表情包附末尾" };
+        if (cfg.EnableTencentSearch)
+            tips.Add("本地没有合适的可用 <SendTencentEmoji keyword=\"关键词\" />，调用后图已直接发出，勿再写 qimage");
         if (cfg.EnableOnlineSearch)
+            tips.Add("也可用 SearchBqbOnline 搜内置索引（关键词5字内），再 DownloadToCache 后 qimage 发送");
+
+        tips.Add("若下一轮没有此提示，则说明系统未允许发表情包，不要擅作主张发出表情");
+        return msg + "\n\n[系统提示：" + string.Join("。", tips) + "]";
+    }
+
+    void TryParseChatTarget(string msg)
+    {
+        string? type = null;
+        string? id = null;
+
+        // 1) 显式 qchat 标签（若存在）
+        var m = QChatTagRegex.Match(msg);
+        if (!m.Success)
+            m = QChatTagRegexAlt.Match(msg);
+        if (m.Success)
         {
-            if (cfg.EnableOnlineImageCache)
+            type = m.Groups["type"].Value;
+            id = m.Groups["id"].Value;
+        }
+
+        // 2) QChat 入站群聊缓冲 / 来源标签（优先群，避免误把发言人当目标）
+        if (type == null)
+        {
+            m = GroupBufferRegex.Match(msg);
+            if (!m.Success)
+                m = GroupChatSourceRegex.Match(msg);
+            if (m.Success)
             {
-                return msg + $"\n\n[系统提示：可以选个表情包附末尾。若列表没有符合当前语境的，可用 SearchBqbOnline 搜在线表情包（关键词5字内），搜到后从结果中选一张，用 <DownloadToCache url=\"URL\" name=\"文件名\" /> 下载再到 <qimage> 发送。\n若下一轮没有此提示，则说明系统未允许发表情包，不发送表情包]";
-            }
-            else
-            {
-                return msg + "\n\n[系统提示：可以选个表情包附末尾。若列表没有符合当前语境的，可用 SearchBqbOnline 搜在线表情包（关键词5字内），搜到后从结果中选一张，用 <DownloadToCache url=\"URL\" name=\"文件名\" /> 下载再到 <qimage> 发送。\n若下一轮没有此提示，则说明系统未允许发表情包，不发送表情包]";
+                type = "Group";
+                id = m.Groups["id"].Value;
             }
         }
-        else
+
+        // 3) QChat 入站私聊
+        if (type == null)
         {
-            return msg + "\n\n[系统提示：现在可以选一个表情包附在回复末尾。若下一轮没有此提示，表示系统未允许你发表情包，不要擅作主张发出<qimage>标签]";
+            m = PrivateSpeakerRegex.Match(msg);
+            if (!m.Success)
+                m = PrivateSourceRegex.Match(msg);
+            if (m.Success)
+            {
+                type = "Private";
+                id = m.Groups["id"].Value;
+            }
+        }
+
+        if (string.IsNullOrEmpty(type) || string.IsNullOrEmpty(id))
+            return;
+
+        lock (_chatTargetLock)
+        {
+            _lastChatType = type;
+            _lastTargetId = id;
+        }
+        LogOnline($"已解析会话目标 type={type} targetid={id}");
+    }
+
+    bool TryGetChatTarget(out string type, out string targetId)
+    {
+        lock (_chatTargetLock)
+        {
+            type = _lastChatType ?? "";
+            targetId = _lastTargetId ?? "";
+            return !string.IsNullOrEmpty(type) && !string.IsNullOrEmpty(targetId);
         }
     }
 
@@ -417,6 +542,7 @@ public class QQEmoji(
         var cfg = Configuration;
         if (cfg == null) return;
 
+        EnsureEmojiPath(cfg);
         var dir = cfg.EmojiPath;
         if (!Directory.Exists(dir))
         {
@@ -756,11 +882,246 @@ public class QQEmoji(
         catch { }
     }
 
+    // ===== 腾讯/搜狗实时表情 =====
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("按关键词搜索腾讯在线表情并直接发送到当前会话。只需传关键词，插件会自动搜图并发出，无需再写 qimage。失败时请改用本地表情包库。")]
+    public async Task SendTencentEmoji(
+        [Description("表情关键词，如：开心、奶龙、滑稽")] string keyword)
+    {
+        var cfg = Configuration;
+        if (cfg == null || !cfg.EnableTencentSearch)
+        {
+            Poke("腾讯在线表情未开启，请用本地库已有文件发 qimage");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(keyword))
+        {
+            Poke("请提供搜索关键词，或改用本地库已有文件发 qimage");
+            return;
+        }
+
+        keyword = keyword.Trim();
+        if (keyword.Length > 20)
+            keyword = keyword[..20];
+
+        if (!TryGetChatTarget(out var chatType, out var targetId))
+        {
+            Poke("无法确定当前会话目标，请改用本地库已有文件发 qimage");
+            LogOnline("SendTencentEmoji 失败：无会话目标");
+            return;
+        }
+
+        try
+        {
+            var items = await SearchTencentApiAsync(keyword, page: 1, num: Math.Max(5, cfg.SearchResultCount));
+            if (items.Count == 0)
+            {
+                Poke($"腾讯表情未搜到「{keyword}」，请改用本地库已有文件发 qimage");
+                return;
+            }
+
+            // 不做尺寸/体积过滤；轻微打散，避免总发同一张
+            var pick = items[RandomNumberGenerator.GetInt32(Math.Min(items.Count, Math.Max(1, cfg.SearchResultCount)))];
+            if (string.IsNullOrWhiteSpace(pick.IndexUrl) ||
+                !Uri.TryCreate(pick.IndexUrl.Trim(), UriKind.Absolute, out var imageUri) ||
+                (imageUri.Scheme != Uri.UriSchemeHttp && imageUri.Scheme != Uri.UriSchemeHttps))
+            {
+                Poke("腾讯表情返回无效链接，请改用本地库已有文件发 qimage");
+                return;
+            }
+
+            var imageUrl = pick.IndexUrl.Trim();
+            LogOnline($"SendTencentEmoji「{keyword}」→ {imageUrl}");
+
+            // 同轮手动调用 QChat 的 qimage，AI 无需再写标签
+            var parameters = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["type"] = chatType,
+                ["targetid"] = targetId,
+                ["image"] = imageUrl,
+            };
+
+            await functionService.HandlerTable.Handle("qimage", new XmlContext
+            {
+                CallMode = CallMode.OneShot,
+                Parameters = parameters,
+            });
+
+            LogOnline($"已同轮直发 qimage type={chatType} targetid={targetId}");
+
+            if (cfg.EnableTencentAutoSave)
+            {
+                var saveName = BuildTencentSaveName(pick);
+#pragma warning disable CS4014
+                Task.Run(async () => await SaveTencentToLibraryAsync(imageUrl, saveName, cfg));
+#pragma warning restore CS4014
+            }
+        }
+        catch (Exception ex)
+        {
+            Poke($"腾讯表情发送失败: {ex.Message}，请改用本地库已有文件发 qimage");
+            LogOnline($"SendTencentEmoji 异常: {ex.Message}");
+        }
+    }
+
+    async Task<List<TencentEmojiItem>> SearchTencentApiAsync(string keyword, int page, int num)
+    {
+        var url = $"{TencentSearchApi}?key={Uri.EscapeDataString(keyword)}&page={page}&num={num}";
+
+        // 超时重试 1 次
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                using var response = await _http.GetAsync(url, cts.Token);
+                response.EnsureSuccessStatusCode();
+
+                var json = await response.Content.ReadAsStringAsync(cts.Token);
+                var root = JsonSerializer.Deserialize<TencentEmojiResponse>(json, _jsonOpts);
+                if (root == null || root.Code != 0)
+                {
+                    LogOnline($"腾讯 API 返回 code={root?.Code} msg={root?.Msg}");
+                    return new List<TencentEmojiItem>();
+                }
+
+                return root.Data?
+                    .Where(x => !string.IsNullOrWhiteSpace(x.IndexUrl))
+                    .ToList() ?? new List<TencentEmojiItem>();
+            }
+            catch (OperationCanceledException) when (attempt == 0)
+            {
+                LogOnline("腾讯 API 超时，重试一次");
+            }
+            catch (Exception ex) when (attempt == 0)
+            {
+                LogOnline($"腾讯 API 请求失败，重试一次: {ex.Message}");
+            }
+        }
+
+        return new List<TencentEmojiItem>();
+    }
+
+    static string BuildTencentSaveName(TencentEmojiItem item)
+    {
+        var format = (item.Format ?? "").Trim().ToLowerInvariant();
+        if (format is not ("gif" or "png" or "jpg" or "jpeg" or "webp"))
+        {
+            // 从 URL 猜后缀
+            try
+            {
+                var path = new Uri(item.IndexUrl).AbsolutePath;
+                var ext = Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
+                format = ext is "gif" or "png" or "jpg" or "jpeg" or "webp" ? ext : "gif";
+            }
+            catch
+            {
+                format = "gif";
+            }
+        }
+
+        var id = string.IsNullOrWhiteSpace(item.ImageId)
+            ? Guid.NewGuid().ToString("N")[..12]
+            : Regex.Replace(item.ImageId, @"[^\w\-]", "");
+        if (string.IsNullOrEmpty(id))
+            id = Guid.NewGuid().ToString("N")[..12];
+
+        return $"tencent_{id}.{format}";
+    }
+
+    async Task SaveTencentToLibraryAsync(string imageUrl, string fileName, QQEmojiConfig cfg)
+    {
+        try
+        {
+            if (!Uri.TryCreate(imageUrl, UriKind.Absolute, out var uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                return;
+
+            fileName = Path.GetFileName(fileName);
+            if (string.IsNullOrEmpty(fileName)) return;
+
+            var ext = Path.GetExtension(fileName).ToLowerInvariant();
+            if (!_imageExts.Contains(ext)) return;
+
+            var dir = cfg.EmojiPath;
+            Directory.CreateDirectory(dir);
+            var dest = Path.Combine(dir, fileName);
+            if (File.Exists(dest)) return;
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+            using var response = await _http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            if (!response.IsSuccessStatusCode) return;
+
+            var contentLength = response.Content.Headers.ContentLength;
+            if (contentLength is > MaxImageBytes) return;
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(cts.Token);
+            if (bytes.Length == 0 || bytes.Length > MaxImageBytes) return;
+
+            await File.WriteAllBytesAsync(dest, bytes);
+            LogOnline($"腾讯表情已入库：{fileName}");
+
+            if (cfg.EnableAutoUpdateEmojiList)
+            {
+                bool shouldRefresh = false;
+                lock (_stateLock)
+                {
+                    _saveCountSinceLastListUpdate++;
+                    if (_saveCountSinceLastListUpdate >= cfg.AutoUpdateThreshold)
+                    {
+                        _saveCountSinceLastListUpdate = 0;
+                        shouldRefresh = true;
+                    }
+                }
+                if (shouldRefresh)
+                {
+                    string newList = BuildEmojiListString(dir, cfg.MaxEmojiListPreview);
+                    Prompt($"📢 表情包列表已更新（含腾讯入库）：\n{newList}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogOnline($"腾讯表情入库失败: {ex.Message}");
+        }
+    }
+
     // ===== 工具方法 =====
+
+    /// <summary>表情包目录不存在时自动创建，避免首次启用报错。</summary>
+    static void EnsureEmojiPath(QQEmojiConfig cfg)
+    {
+        if (string.IsNullOrWhiteSpace(cfg.EmojiPath))
+            cfg.EmojiPath = Path.Combine(AlifePath.StorageFolderPath, "QQEmojis");
+
+        try
+        {
+            Directory.CreateDirectory(cfg.EmojiPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[QQEmoji] 创建表情包目录失败：{cfg.EmojiPath}，{ex.Message}");
+        }
+    }
 
     static List<string> GetImageFiles(string dir)
     {
-        if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
+        if (string.IsNullOrWhiteSpace(dir))
+            return new List<string>();
+
+        try
+        {
+            if (!Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+        }
+        catch
+        {
+            return new List<string>();
+        }
+
+        if (!Directory.Exists(dir))
             return new List<string>();
 
         return Directory.GetFiles(dir)
@@ -770,6 +1131,13 @@ public class QQEmoji(
 
     string BuildEmojiListString(string dir, int maxPreview = 50)
     {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+        }
+        catch { }
+
         if (!Directory.Exists(dir)) return "(空)";
 
         var files = GetImageFiles(dir)

@@ -228,6 +228,7 @@ public partial class QQEmojiUI : ModuleUIBase<QQEmoji, QQEmojiConfig>
 .qem-card:nth-child(4) { animation-delay: 0.20s; }
 .qem-card:nth-child(5) { animation-delay: 0.25s; }
 .qem-card:nth-child(6) { animation-delay: 0.30s; }
+.qem-card:nth-child(7) { animation-delay: 0.35s; }
 @keyframes qem-card-in {
     from { opacity: 0; transform: translateY(16px) scale(0.96); filter: blur(4px); }
     to { opacity: 1; transform: none; filter: none; }
@@ -447,7 +448,17 @@ public partial class QQEmojiUI : ModuleUIBase<QQEmoji, QQEmojiConfig>
 
         // ---- 卡1: 基础 & 策略 ----
         OpenCard(b, ref i, "📁", "基础 & 策略");
-        AddInput(b, ref i, "表情包目录", Configuration.EmojiPath, v => Configuration.EmojiPath = v);
+        AddInput(b, ref i, "表情包目录", Configuration.EmojiPath, v =>
+        {
+            Configuration.EmojiPath = v;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(v))
+                    Directory.CreateDirectory(v);
+            }
+            catch { }
+        });
+        AddHint(b, ref i, "目录不存在时会自动创建，无需手动建文件夹");
         AddHint(b, ref i, "存图和 AI 发图共用同一目录");
         AddInput(b, ref i, "基础概率 (0-100%)", Configuration.AutoProbability.ToString(), v =>
         {
@@ -541,10 +552,10 @@ public partial class QQEmojiUI : ModuleUIBase<QQEmoji, QQEmojiConfig>
         AddHint(b, ref i, "在运行窗口显示插件运行日志");
         CloseCard(b);
 
-        // ---- 卡5: 在线搜图 ----
-        OpenCard(b, ref i, "🌐", "在线搜图");
-        AddSwitch(b, ref i, "启用在线搜图", Configuration.EnableOnlineSearch, v => Configuration.EnableOnlineSearch = v);
-        AddHint(b, ref i, "AI 可用 SearchBqbOnline 搜内置 ChineseBQB 索引");
+        // ---- 卡5: 在线搜图（BQB 内置索引） ----
+        OpenCard(b, ref i, "🌐", "在线搜图·BQB");
+        AddSwitch(b, ref i, "启用 BQB 在线搜图", Configuration.EnableOnlineSearch, v => Configuration.EnableOnlineSearch = v);
+        AddHint(b, ref i, "AI 可用 SearchBqbOnline 搜内置 ChineseBQB 索引（需下载后再发）");
 
         if (Configuration.EnableOnlineSearch)
         {
@@ -561,7 +572,7 @@ public partial class QQEmojiUI : ModuleUIBase<QQEmoji, QQEmojiConfig>
             {
                 if (int.TryParse(v, out var n)) Configuration.SearchResultCount = Math.Max(1, n);
             });
-            AddHint(b, ref i, "每次搜索返回的最大条数，建议 3–10");
+            AddHint(b, ref i, "每次搜索返回的最大条数，建议 3–10（腾讯源也会复用此数量）");
 
             Sep(b, ref i);
             AddSwitch(b, ref i, "自动下载搜索结果到表情包目录", Configuration.EnableOnlineImageCache, v => Configuration.EnableOnlineImageCache = v);
@@ -576,7 +587,32 @@ public partial class QQEmojiUI : ModuleUIBase<QQEmoji, QQEmojiConfig>
             }
 
             AddSwitch(b, ref i, "搜图日志", Configuration.EnableOnlineSearchLog, v => Configuration.EnableOnlineSearchLog = v);
-            AddHint(b, ref i, "显示索引加载、下载/缓存与搜索结果日志");
+            AddHint(b, ref i, "显示索引加载、下载/缓存、腾讯搜图与搜索结果日志");
+        }
+        CloseCard(b);
+
+        // ---- 卡6: 腾讯实时表情（推荐） ----
+        OpenCard(b, ref i, "✨", "腾讯实时表情（推荐）");
+        AddSwitch(b, ref i, "启用腾讯在线表情（推荐）", Configuration.EnableTencentSearch, v => Configuration.EnableTencentSearch = v);
+        AddHint(b, ref i, "推荐开启（默认开）。AI 只需 <SendTencentEmoji keyword=\"开心\" />，插件自动搜图并同轮直发，无需再写 qimage");
+
+        if (Configuration.EnableTencentSearch)
+        {
+            AddSwitch(b, ref i, "是否自动保存到库", Configuration.EnableTencentAutoSave, v => Configuration.EnableTencentAutoSave = v);
+            if (Configuration.EnableTencentAutoSave)
+            {
+                AddHint(b, ref i, "✓ 发送成功后后台下载到本地表情包目录，方便下次本地直接用");
+            }
+            else
+            {
+                AddHint(b, ref i, "仅用 URL 直发，不下载到本地库");
+            }
+
+            if (!Configuration.EnableOnlineSearch)
+            {
+                AddSwitch(b, ref i, "搜图日志", Configuration.EnableOnlineSearchLog, v => Configuration.EnableOnlineSearchLog = v);
+                AddHint(b, ref i, "显示腾讯搜图与发送日志");
+            }
         }
         CloseCard(b);
 
