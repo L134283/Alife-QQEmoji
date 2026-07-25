@@ -24,7 +24,8 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 | **qimage 格式** | 支持 `type`（Private/Group）和 `targetid`（QQ号/群号）属性 |
 | **在线搜图·BQB** | AI 用 `SearchBqbOnline` 搜索内置 ChineseBQB 索引，搜到后下载到本地再发送 |
 | **自动缓存** | BQB 搜索结果图片自动缓存到本地（可开关），下次搜到同一张直接复用，过期自动清理 |
-| **腾讯实时表情** | AI 只需 `<SendTencentEmoji keyword="开心" />`，插件自动搜图并同轮直发，无需再写 `qimage` |
+| **腾讯实时表情** | AI 用 `<SendTencentEmoji keyword="开心" type="Private/Group" targetid="号" />` 一键搜图直发；也可只传关键词 |
+| **会话目标来源** | 可切换：优先 AI 出站参数 / 优先入站 QChat 缓存；双向回退；非 QQ 环境只返回 URL 不报错 |
 | **腾讯自动入库** | 可选：发送成功后后台下载到本地表情包库，方便下次本地直接用 |
 
 ## 原理
@@ -81,10 +82,17 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 | 启用 BQB 在线搜图 | 关 | 开启后 AI 可搜索内置 ChineseBQB 索引 |
 | 图片下载源 | 镜像源 | 镜像源（jsDelivr CDN）/ GitHub源，仅影响 BQB 图片下载 |
 | 启用腾讯在线表情 | **开（推荐）** | 开启后 AI 可用 `SendTencentEmoji` 一键搜图直发 |
+| 会话目标取自 AI 出站参数 | **开（推荐）** | 开=优先 AI 的 type/targetid；关=优先入站 QChat 缓存；两侧都无目标时只搜图返回 URL |
 | 是否自动保存到库 | 关 | 腾讯表情发送成功后是否下载到本地表情包目录 |
 | 搜索结果数量 | 5条 | 每次搜索返回的最大结果条数 |
 | 自动下载搜索结果 | 关 | 开=搜到的图自动存入表情包目录永久保存，关=临时缓存 5h |
 | 搜图日志 | 关 | 在运行窗口显示在线搜图相关日志 |
+
+## v1.5.1 主要更新
+
+- **会话目标来源开关**：默认优先从 AI 调用参数 `type`/`targetid` 取目标（与 `qimage` 一致），入站 QChat 缓存作回退
+- **非 QQ 环境软降级**：无法确定会话目标时不再报「未找到会话目标」，改为搜图并返回 URL 供 AI 自行处理
+- **Prompt 同步**：开启「取自 AI 出站参数」时，提示 AI 调用 `SendTencentEmoji` 时带上 `type`/`targetid`
 
 ## AI 可用函数
 
@@ -93,6 +101,7 @@ AI 会自动用 `<SaveImage>` 保存图片到本地表情库。
 <ListEmojis />                                         查看可用表情
 <SearchBqbOnline keyword="关键词" />                   搜索在线表情包（返回名称+URL）
 <DownloadToCache url="URL" name="文件名" />            下载搜索结果图片到本地
+<SendTencentEmoji keyword="开心" type="Private" targetid="QQ号" />  腾讯表情一键直发
 ```
 
 ### 发图格式

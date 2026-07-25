@@ -594,10 +594,20 @@ public partial class QQEmojiUI : ModuleUIBase<QQEmoji, QQEmojiConfig>
         // ---- 卡6: 腾讯实时表情（推荐） ----
         OpenCard(b, ref i, "✨", "腾讯实时表情（推荐）");
         AddSwitch(b, ref i, "启用腾讯在线表情（推荐）", Configuration.EnableTencentSearch, v => Configuration.EnableTencentSearch = v);
-        AddHint(b, ref i, "推荐开启（默认开）。AI 只需 <SendTencentEmoji keyword=\"开心\" />，插件自动搜图并同轮直发，无需再写 qimage");
+        AddHint(b, ref i, "推荐开启（默认开）。AI 用 <SendTencentEmoji keyword=\"开心\" type=\"Private/Group\" targetid=\"号\" /> 一键搜图直发");
 
         if (Configuration.EnableTencentSearch)
         {
+            AddSwitch(b, ref i, "会话目标取自 AI 出站参数（推荐）", Configuration.TencentSessionFromAi, v => Configuration.TencentSessionFromAi = v);
+            if (Configuration.TencentSessionFromAi)
+            {
+                AddHint(b, ref i, "✓ 优先用 AI 调用里的 type/targetid；没有则回退入站缓存。非 QQ 环境只搜图返回 URL，不报「未找到会话目标」");
+            }
+            else
+            {
+                AddHint(b, ref i, "优先用入站 QChat 解析的会话目标；没有则回退 AI 参数。非 QQ 环境同样软降级");
+            }
+
             AddSwitch(b, ref i, "是否自动保存到库", Configuration.EnableTencentAutoSave, v => Configuration.EnableTencentAutoSave = v);
             if (Configuration.EnableTencentAutoSave)
             {

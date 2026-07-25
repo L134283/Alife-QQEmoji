@@ -80,6 +80,13 @@ public record QQEmojiConfig
 
     /// <summary>腾讯表情发送成功后，是否顺便下载保存到本地表情包库。</summary>
     public bool EnableTencentAutoSave { get; set; } = false;
+
+    /// <summary>
+    /// true=优先从 AI 调用参数取 type/targetid（出站侧，推荐）；
+    /// false=优先用入站 QChat 缓存（旧逻辑）。
+    /// 两侧都没有目标时软降级：只搜图返回 URL，不报「未找到会话目标」。
+    /// </summary>
+    public bool TencentSessionFromAi { get; set; } = true;
 }
 
 public class TencentEmojiItem
@@ -240,12 +247,25 @@ public class QQEmoji(
 
         if (cfg.EnableTencentSearch)
         {
-            Prompt("""
-                【在线表情包·腾讯】需要在线表情时，只调用一次：
-                <SendTencentEmoji keyword="关键词" />
-                插件会自动搜索并直接发出图片，你无需再写 <qimage>，也不要第二轮补发。
-                若函数反馈失败，请改用本地表情包库已有文件发 <qimage>。
-                """);
+            if (cfg.TencentSessionFromAi)
+            {
+                Prompt("""
+                    【在线表情包·腾讯】需要在线表情时，只调用一次（请带上会话目标，与 qimage 字段一致）：
+                    <SendTencentEmoji keyword="关键词" type="Private/Group" targetid="QQ号或群号" />
+                    插件会自动搜索并直接发出图片，你无需再写 <qimage>，也不要第二轮补发。
+                    若当前不在 QQ 会话、无法确定目标，仍可只传 keyword 搜图；函数会返回图片 URL，你可自行决定是否用 <qimage> 发出。
+                    若函数反馈失败，请改用本地表情包库已有文件发 <qimage>。
+                    """);
+            }
+            else
+            {
+                Prompt("""
+                    【在线表情包·腾讯】需要在线表情时，只调用一次：
+                    <SendTencentEmoji keyword="关键词" />
+                    插件会自动搜索并直接发出图片，你无需再写 <qimage>，也不要第二轮补发。
+                    若函数反馈失败，请改用本地表情包库已有文件发 <qimage>。
+                    """);
+            }
         }
 
         LogGeneral($"启动完成，表情包目录：{cfg.EmojiPath}，当前共 {GetImageFiles(cfg.EmojiPath).Count} 个文件");
@@ -322,7 +342,12 @@ public class QQEmoji(
 
         var tips = new List<string> { "可以选个表情包附末尾" };
         if (cfg.EnableTencentSearch)
-            tips.Add("本地没有合适的可用 <SendTencentEmoji keyword=\"关键词\" />，调用后图已直接发出，勿再写 qimage");
+        {
+            if (cfg.TencentSessionFromAi)
+                tips.Add("本地没有合适的可用 <SendTencentEmoji keyword=\"关键词\" type=\"Private/Group\" targetid=\"QQ号或群号\" />，调用后图已直接发出，勿再写 qimage");
+            else
+                tips.Add("本地没有合适的可用 <SendTencentEmoji keyword=\"关键词\" />，调用后图已直接发出，勿再写 qimage");
+        }
         if (cfg.EnableOnlineSearch)
             tips.Add("也可用 SearchBqbOnline 搜内置索引（关键词5字内），再 DownloadToCache 后 qimage 发送");
 
@@ -390,6 +415,78 @@ public class QQEmoji(
             targetId = _lastTargetId ?? "";
             return !string.IsNullOrEmpty(type) && !string.IsNullOrEmpty(targetId);
         }
+    }
+
+    /// <summary>
+    /// 规范化 AI 传入的 type/targetid；合法则返回 true。
+    /// type 接受 Private/Group（大小写不敏感），targetid 须为纯数字。
+    /// </summary>
+    static bool TryNormalizeAiTarget(string? type, string? targetId, out string chatType, out string id)
+    {
+        chatType = "";
+        id = "";
+        if (string.IsNullOrWhiteSpace(type) || string.IsNullOrWhiteSpace(targetId))
+            return false;
+
+        var t = type.Trim();
+        var tid = targetId.Trim();
+        if (tid.Length == 0 || !tid.All(char.IsDigit))
+            return false;
+
+        if (t.Equals("Private", StringComparison.OrdinalIgnoreCase))
+            chatType = "Private";
+        else if (t.Equals("Group", StringComparison.OrdinalIgnoreCase))
+            chatType = "Group";
+        else
+            return false;
+
+        id = tid;
+        return true;
+    }
+
+    /// <summary>
+    /// 按开关解析会话目标：AI 参数优先或入站缓存优先，另一侧作回退。
+    /// </summary>
+    bool ResolveChatTarget(string? aiType, string? aiTargetId, out string chatType, out string targetId)
+    {
+        chatType = "";
+        targetId = "";
+        var fromAi = Configuration?.TencentSessionFromAi ?? true;
+        var aiOk = TryNormalizeAiTarget(aiType, aiTargetId, out var aType, out var aId);
+        var cacheOk = TryGetChatTarget(out var cType, out var cId);
+
+        if (fromAi)
+        {
+            if (aiOk)
+            {
+                chatType = aType;
+                targetId = aId;
+                return true;
+            }
+            if (cacheOk)
+            {
+                chatType = cType;
+                targetId = cId;
+                return true;
+            }
+        }
+        else
+        {
+            if (cacheOk)
+            {
+                chatType = cType;
+                targetId = cId;
+                return true;
+            }
+            if (aiOk)
+            {
+                chatType = aType;
+                targetId = aId;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     DecisionResult Decide(string inputText, QQEmojiConfig cfg)
@@ -885,9 +982,11 @@ public class QQEmoji(
     // ===== 腾讯/搜狗实时表情 =====
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("按关键词搜索腾讯在线表情并直接发送到当前会话。只需传关键词，插件会自动搜图并发出，无需再写 qimage。失败时请改用本地表情包库。")]
+    [Description("按关键词搜索腾讯在线表情并直接发送到当前会话。推荐同时传 type/targetid（与 qimage 一致）。无会话目标时仅返回图片 URL，不报错。失败时请改用本地表情包库。")]
     public async Task SendTencentEmoji(
-        [Description("表情关键词，如：开心、奶龙、滑稽")] string keyword)
+        [Description("表情关键词，如：开心、奶龙、滑稽")] string keyword,
+        [Description("会话类型：Private 或 Group（推荐与 qimage 一致）")] string? type = null,
+        [Description("QQ号或群号（推荐与 qimage 一致）")] string? targetid = null)
     {
         var cfg = Configuration;
         if (cfg == null || !cfg.EnableTencentSearch)
@@ -906,12 +1005,9 @@ public class QQEmoji(
         if (keyword.Length > 20)
             keyword = keyword[..20];
 
-        if (!TryGetChatTarget(out var chatType, out var targetId))
-        {
-            Poke("无法确定当前会话目标，请改用本地库已有文件发 qimage");
-            LogOnline("SendTencentEmoji 失败：无会话目标");
-            return;
-        }
+        var hasTarget = ResolveChatTarget(type, targetid, out var chatType, out var targetId);
+        if (!hasTarget)
+            LogOnline("SendTencentEmoji：无会话目标，将软降级为仅搜图返回 URL");
 
         try
         {
@@ -934,6 +1030,13 @@ public class QQEmoji(
 
             var imageUrl = pick.IndexUrl.Trim();
             LogOnline($"SendTencentEmoji「{keyword}」→ {imageUrl}");
+
+            // 非 QQ 环境 / 无目标：软降级，只返回 URL，不硬失败
+            if (!hasTarget)
+            {
+                Poke($"已搜到表情（当前无会话目标，未直发）：{imageUrl}。若在 QQ 会话中，请带 type/targetid 再调；或自行用 <qimage type=\"Private/Group\" targetid=\"号\" image=\"{imageUrl}\" /> 发出；也可改用本地库。");
+                return;
+            }
 
             // 同轮手动调用 QChat 的 qimage，AI 无需再写标签
             var parameters = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
