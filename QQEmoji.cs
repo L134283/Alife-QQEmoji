@@ -166,6 +166,15 @@ public class QQEmoji(
     static readonly Regex PrivateSourceRegex = new(
         @"\[私聊\s+(?<id>\d+)",
         RegexOptions.Compiled);
+    // ===== Alife 4.2.x QChat 新格式 =====
+    // 群聊：[群聊消息(123456,群名)] 或 [群聊消息(123456)]
+    static readonly Regex GroupMsgRegex = new(
+        @"\[群聊消息\((?<id>\d+)",
+        RegexOptions.Compiled);
+    // 私聊：[私聊消息(2686267740,doro)]
+    static readonly Regex PrivateMsgRegex = new(
+        @"\[私聊消息\((?<id>\d+)",
+        RegexOptions.Compiled);
 
     static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
 
@@ -205,7 +214,7 @@ public class QQEmoji(
         await base.AwakeAsync(context);
 
         XmlHandler handler = new(this);
-        functionService.RegisterHandler(handler);
+        functionService.RegisterHandler(handler, cancellationToken: DestroyCancellationToken);
 
         var cfg = Configuration ?? new QQEmojiConfig();
         EnsureEmojiPath(cfg);
@@ -309,7 +318,9 @@ public class QQEmoji(
 
     string OnChatSend(string msg)
     {
-        if (!msg.Contains("消息来源:[QChatService]")) return msg;
+        // 4.2.x 格式：[消息来源(QChatService)]；旧格式：消息来源:[QChatService]
+        if (!msg.Contains("[消息来源(QChatService)]") &&
+            !msg.Contains("消息来源:[QChatService]")) return msg;
 
         // 始终尝试解析当次会话目标，供腾讯源同轮直发使用
         TryParseChatTarget(msg);
@@ -373,7 +384,10 @@ public class QQEmoji(
         // 2) QChat 入站群聊缓冲 / 来源标签（优先群，避免误把发言人当目标）
         if (type == null)
         {
-            m = GroupBufferRegex.Match(msg);
+            // 4.2.x：[群聊消息(群号,群名)]
+            m = GroupMsgRegex.Match(msg);
+            if (!m.Success)
+                m = GroupBufferRegex.Match(msg);
             if (!m.Success)
                 m = GroupChatSourceRegex.Match(msg);
             if (m.Success)
@@ -386,7 +400,10 @@ public class QQEmoji(
         // 3) QChat 入站私聊
         if (type == null)
         {
-            m = PrivateSpeakerRegex.Match(msg);
+            // 4.2.x：[私聊消息(QQ号,昵称)]
+            m = PrivateMsgRegex.Match(msg);
+            if (!m.Success)
+                m = PrivateSpeakerRegex.Match(msg);
             if (!m.Success)
                 m = PrivateSourceRegex.Match(msg);
             if (m.Success)
