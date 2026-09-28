@@ -11,9 +11,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
 using Alife.Function.FunctionCaller;
-using Alife.Function.Interpreter;
 using Alife.Platform;
 using Microsoft.SemanticKernel;
+using OneBotMessageType = Alife.Function.QChat.OneBotMessageType;
+using QChatService = Alife.Function.QChat.QChatService;
 
 namespace Alife.Plugin.QQEmoji;
 
@@ -114,7 +115,8 @@ public class TencentEmojiResponse
     EditorUI = typeof(QQEmojiUI))]
 [Description("QQ表情包存发管理：存图+智能发图。")]
 public class QQEmoji(
-    XmlFunctionCaller functionService
+    XmlFunctionCaller functionService,
+    QChatService? qchatService = null // 软依赖：QChat 未安装/未加载时为 null，插件照常加载，腾讯直发降级为只返回 URL
 ) : InteractiveModule<QQEmoji>, IConfigurable<QQEmojiConfig>
 {
     public QQEmojiConfig? Configuration { get; set; }
@@ -278,6 +280,8 @@ public class QQEmoji(
         }
 
         LogGeneral($"启动完成，表情包目录：{cfg.EmojiPath}，当前共 {GetImageFiles(cfg.EmojiPath).Count} 个文件");
+        if (cfg.EnableTencentSearch && qchatService == null)
+            LogGeneral("未检测到 QChat 模块：SendTencentEmoji 将只搜图返回 URL，不自动直发（让角色启用 Alife.Function.QChat 后重载即可恢复）");
     }
 
     static void CleanTempCache(QQEmojiConfig cfg)
@@ -504,6 +508,31 @@ public class QQEmoji(
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 同轮直发图片：直接调用 QChat 模块的 QImage。
+    /// 比手动构造 XmlContext 走 HandlerTable 更稳：参数类型由编译器校验，不受框架内部结构变化影响。
+    /// 返回 false 表示未发出（QChat 不可用 / QQ 未连接 / 目标非法），调用方据此软降级为只返回 URL。
+    /// </summary>
+    async Task<(bool ok, string reason)> TrySendImageDirectAsync(string chatType, string targetId, string imageUrl)
+    {
+        if (qchatService == null)
+            return (false, "QChat 模块不可用，未安装或未加载");
+
+        if (!qchatService.IsConnected)
+            return (false, "QQ 尚未连接");
+
+        if (!long.TryParse(targetId, out var targetIdLong) || targetIdLong <= 0)
+            return (false, $"会话目标非法 targetid={targetId}");
+
+        var messageType = chatType.Equals("Group", StringComparison.OrdinalIgnoreCase)
+            ? OneBotMessageType.Group
+            : OneBotMessageType.Private;
+
+        await qchatService.QImage(messageType, targetIdLong, imageUrl);
+        LogOnline($"已通过 QChat 模块直发图片 type={chatType} targetid={targetId}");
+        return (true, "");
     }
 
     DecisionResult Decide(string inputText, QQEmojiConfig cfg)
@@ -999,7 +1028,7 @@ public class QQEmoji(
     // ===== 腾讯/搜狗实时表情 =====
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("按关键词搜索腾讯在线表情并直接发送到当前会话。推荐同时传 type/targetid（与 qimage 一致）。无会话目标时仅返回图片 URL，不报错。失败时请改用本地表情包库。")]
+    [Description("按关键词搜索腾讯在线表情并直接发送到当前会话。推荐同时传 type/targetid（与 qimage 一致）。无会话目标或 QQ 未连接时仅返回图片 URL，不报错。失败时请改用本地表情包库。")]
     public async Task SendTencentEmoji(
         [Description("表情关键词，如：开心、奶龙、滑稽")] string keyword,
         [Description("会话类型：Private 或 Group（推荐与 qimage 一致）")] string? type = null,
@@ -1055,21 +1084,14 @@ public class QQEmoji(
                 return;
             }
 
-            // 同轮手动调用 QChat 的 qimage，AI 无需再写标签
-            var parameters = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            // 同轮直发：直接调用 QChat 模块的 QImage（软依赖），AI 无需再写标签
+            var (sent, reason) = await TrySendImageDirectAsync(chatType, targetId, imageUrl);
+            if (!sent)
             {
-                ["type"] = chatType,
-                ["targetid"] = targetId,
-                ["image"] = imageUrl,
-            };
-
-            await functionService.HandlerTable.Handle("qimage", new XmlContext
-            {
-                CallMode = CallMode.OneShot,
-                Parameters = parameters,
-            });
-
-            LogOnline($"已同轮直发 qimage type={chatType} targetid={targetId}");
+                Poke($"已搜到表情，但未自动直发（{reason}）：{imageUrl}。请检查 QQ 连接后重试，或改用本地表情包库。");
+                LogOnline($"SendTencentEmoji：未直发（{reason}），已返回 URL");
+                return;
+            }
 
             if (cfg.EnableTencentAutoSave)
             {
