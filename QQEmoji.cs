@@ -11,8 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
 using Alife.Function.FunctionCaller;
-using Alife.Platform;
-using Microsoft.SemanticKernel;
+using Alife.Foundation;
 using OneBotMessageType = Alife.Function.QChat.OneBotMessageType;
 using QChatService = Alife.Function.QChat.QChatService;
 
@@ -116,11 +115,18 @@ public class TencentEmojiResponse
 [Description("QQ表情包存发管理：存图+智能发图。")]
 public class QQEmoji(
     XmlFunctionCaller functionService,
+    Interactor<QQEmoji> interactor,
     QChatService? qchatService = null // 软依赖：QChat 未安装/未加载时为 null，插件照常加载，腾讯直发降级为只返回 URL
-) : InteractiveModule<QQEmoji>, IConfigurable<QQEmojiConfig>
+) : ChatBehaviour, IConfigurable<QQEmojiConfig>
 {
-    public QQEmojiConfig? Configuration { get; set; }
+    public QQEmojiConfig Configuration { get; set; } = null!;
     static readonly HttpClient _http = new();
+
+    bool _initialized;
+
+    // 统一走 Interactor：自动带 [功能说明(QQEmoji)] 标签，且支持热重载时提示词替换
+    void Prompt(string prompt) => interactor.Prompt(prompt);
+    void Poke(string message) => interactor.Poke(message);
 
     DateTime _lastSendTime = DateTime.MinValue;
     int _burstCount;
@@ -211,18 +217,43 @@ public class QQEmoji(
     static string GetTempCachePath(QQEmojiConfig cfg) =>
         Path.Combine(cfg.EmojiPath, CacheSubDir);
 
-    public override async Task AwakeAsync(AwakeContext context)
+    protected override async Task OnAwake()
     {
-        await base.AwakeAsync(context);
+        // 重载/角色重建时同一实例可能被重复 Awake，避免 handler 与提示词重复注册
+        if (_initialized) return;
 
         XmlHandler handler = new(this);
         functionService.RegisterHandler(handler, cancellationToken: DestroyCancellationToken);
+        _initialized = true;
 
         var cfg = Configuration ?? new QQEmojiConfig();
         EnsureEmojiPath(cfg);
-        string emojiList = BuildEmojiListString(cfg.EmojiPath, cfg.MaxEmojiListPreview);
 
-        Prompt($$"""
+        if (cfg.EnableOnlineSearch)
+        {
+            await LoadBqbIndexAsync(cfg);
+            if (!cfg.EnableOnlineImageCache)
+                CleanTempCache(cfg);
+        }
+
+        // Interactor 只有一个专属提示词槽位（重复 Prompt 会互相覆盖），因此必须拼成一整段注入
+        Prompt(BuildPromptText(cfg));
+
+        LogGeneral($"启动完成，表情包目录：{cfg.EmojiPath}，当前共 {GetImageFiles(cfg.EmojiPath).Count} 个文件");
+        if (cfg.EnableTencentSearch && qchatService == null)
+            LogGeneral("未检测到 QChat 模块：SendTencentEmoji 将只搜图返回 URL，不自动直发（让角色启用 Alife.Function.QChat 后重载即可恢复）");
+    }
+
+    /// <summary>
+    /// 拼出完整提示词（表情包列表 + 在线搜图 + 腾讯表情说明）。
+    /// note 用于存图后刷新列表时追加说明，整段覆盖写入提示词槽位。
+    /// </summary>
+    string BuildPromptText(QQEmojiConfig cfg, string? note = null)
+    {
+        string emojiList = BuildEmojiListString(cfg.EmojiPath, cfg.MaxEmojiListPreview);
+        var parts = new List<string>();
+
+        parts.Add($$"""
             你有本地表情包库，存放在：{{cfg.EmojiPath}}
 
             【存图】当用户说「存为xxx」时，用以下格式保存图片：
@@ -240,48 +271,36 @@ public class QQEmoji(
 
         if (cfg.EnableOnlineSearch)
         {
-            await LoadBqbIndexAsync(cfg);
-
-            if (cfg.EnableOnlineImageCache)
-            {
-                Prompt($@"【在线表情包·BQB】SearchBqbOnline 搜内置索引（关键词5字内）。
-从结果中选一张：若标注[已在库中]则直接用 <qimage> 发出；否则用 <DownloadToCache url=""URL"" name=""文件名"" /> 下载后再发。");
-            }
-            else
-            {
-                Prompt($@"【在线表情包·BQB】SearchBqbOnline 搜内置索引（关键词5字内）。
+            parts.Add(cfg.EnableOnlineImageCache
+                ? $@"【在线表情包·BQB】SearchBqbOnline 搜内置索引（关键词5字内）。
+从结果中选一张：若标注[已在库中]则直接用 <qimage> 发出；否则用 <DownloadToCache url=""URL"" name=""文件名"" /> 下载后再发。"
+                : $@"【在线表情包·BQB】SearchBqbOnline 搜内置索引（关键词5字内）。
 从结果中选一张：若标注[已缓存]则直接用 <qimage> 发出；否则用 <DownloadToCache url=""URL"" name=""文件名"" /> 下载到缓存后再发。
 缓存目录 {GetTempCachePath(cfg)}，每 5 小时和启动时自动清理。");
-                CleanTempCache(cfg);
-            }
         }
 
         if (cfg.EnableTencentSearch)
         {
-            if (cfg.TencentSessionFromAi)
-            {
-                Prompt("""
-                    【在线表情包·腾讯】需要在线表情时，只调用一次（请带上会话目标，与 qimage 字段一致）：
-                    <SendTencentEmoji keyword="关键词" type="Private/Group" targetid="QQ号或群号" />
-                    插件会自动搜索并直接发出图片，你无需再写 <qimage>，也不要第二轮补发。
-                    若当前不在 QQ 会话、无法确定目标，仍可只传 keyword 搜图；函数会返回图片 URL，你可自行决定是否用 <qimage> 发出。
-                    若函数反馈失败，请改用本地表情包库已有文件发 <qimage>。
-                    """);
-            }
-            else
-            {
-                Prompt("""
-                    【在线表情包·腾讯】需要在线表情时，只调用一次：
-                    <SendTencentEmoji keyword="关键词" />
-                    插件会自动搜索并直接发出图片，你无需再写 <qimage>，也不要第二轮补发。
-                    若函数反馈失败，请改用本地表情包库已有文件发 <qimage>。
-                    """);
-            }
+            parts.Add(cfg.TencentSessionFromAi
+                ? """
+                【在线表情包·腾讯】需要在线表情时，只调用一次（请带上会话目标，与 qimage 字段一致）：
+                <SendTencentEmoji keyword="关键词" type="Private/Group" targetid="QQ号或群号" />
+                插件会自动搜索并直接发出图片，你无需再写 <qimage>，也不要第二轮补发。
+                若当前不在 QQ 会话、无法确定目标，仍可只传 keyword 搜图；函数会返回图片 URL，你可自行决定是否用 <qimage> 发出。
+                若函数反馈失败，请改用本地表情包库已有文件发 <qimage>。
+                """
+                : """
+                【在线表情包·腾讯】需要在线表情时，只调用一次：
+                <SendTencentEmoji keyword="关键词" />
+                插件会自动搜索并直接发出图片，你无需再写 <qimage>，也不要第二轮补发。
+                若函数反馈失败，请改用本地表情包库已有文件发 <qimage>。
+                """);
         }
 
-        LogGeneral($"启动完成，表情包目录：{cfg.EmojiPath}，当前共 {GetImageFiles(cfg.EmojiPath).Count} 个文件");
-        if (cfg.EnableTencentSearch && qchatService == null)
-            LogGeneral("未检测到 QChat 模块：SendTencentEmoji 将只搜图返回 URL，不自动直发（让角色启用 Alife.Function.QChat 后重载即可恢复）");
+        if (!string.IsNullOrWhiteSpace(note))
+            parts.Add(note);
+
+        return string.Join("\n\n", parts);
     }
 
     static void CleanTempCache(QQEmojiConfig cfg)
@@ -306,25 +325,38 @@ public class QQEmoji(
         _lastCacheClean = DateTime.UtcNow;
     }
 
-    public override async Task StartAsync(Kernel kernel, ChatActivity chatActivity)
+    protected override Task OnStart()
     {
-        await base.StartAsync(kernel, chatActivity);
-
+        // OnStart 在所有同期模块 Awake 之后触发，此时 ChatBot 已完全就绪
         ChatBot.ChatSend -= OnChatSend;
         ChatBot.ChatSend += OnChatSend;
+        LogGeneral($"已挂接出站消息过滤，识别标记：{Interactor<QChatService>.GetMessageTag()}");
+        return Task.CompletedTask;
     }
 
-    public override Task DestroyAsync()
+    /// <summary>
+    /// 判断用户消息是否来自 QChat。
+    /// 5.x：Interactor&lt;T&gt; 统一生成 [源(QChatService)]；
+    /// 4.2.x：[消息来源(QChatService)]；更早：消息来源:[QChatService]。
+    /// </summary>
+    static bool IsFromQChat(string msg)
+    {
+        if (msg.Contains(Interactor<QChatService>.GetMessageTag(), StringComparison.Ordinal))
+            return true;
+
+        return msg.Contains("[消息来源(QChatService)]", StringComparison.Ordinal)
+            || msg.Contains("消息来源:[QChatService]", StringComparison.Ordinal);
+    }
+
+    protected override Task OnDestroy()
     {
         ChatBot.ChatSend -= OnChatSend;
-        return base.DestroyAsync();
+        return Task.CompletedTask;
     }
 
     string OnChatSend(string msg)
     {
-        // 4.2.x 格式：[消息来源(QChatService)]；旧格式：消息来源:[QChatService]
-        if (!msg.Contains("[消息来源(QChatService)]") &&
-            !msg.Contains("消息来源:[QChatService]")) return msg;
+        if (!IsFromQChat(msg)) return msg;
 
         // 始终尝试解析当次会话目标，供腾讯源同轮直发使用
         TryParseChatTarget(msg);
@@ -662,8 +694,7 @@ public class QQEmoji(
                 if (_saveCountSinceLastListUpdate >= cfg.AutoUpdateThreshold)
                 {
                     _saveCountSinceLastListUpdate = 0;
-                    string newList = BuildEmojiListString(dir, cfg.MaxEmojiListPreview);
-                    Prompt($"📢 表情包列表已更新（存了 {cfg.AutoUpdateThreshold} 个新图后自动刷新）：\n{newList}");
+                    Prompt(BuildPromptText(cfg, $"📢 表情包列表已更新（存了 {cfg.AutoUpdateThreshold} 个新图后自动刷新），以上列表可正常使用。"));
                     LogGeneral($"已达阈值 {cfg.AutoUpdateThreshold}，已向 AI 推送最新表情包列表");
                 }
             }
@@ -1218,10 +1249,7 @@ public class QQEmoji(
                     }
                 }
                 if (shouldRefresh)
-                {
-                    string newList = BuildEmojiListString(dir, cfg.MaxEmojiListPreview);
-                    Prompt($"📢 表情包列表已更新（含腾讯入库）：\n{newList}");
-                }
+                    Prompt(BuildPromptText(cfg, "📢 表情包列表已更新（含腾讯表情入库），以上列表可正常使用。"));
             }
         }
         catch (Exception ex)

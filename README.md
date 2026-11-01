@@ -148,6 +148,8 @@ DownloadToCache（下载到本地，返回缓存的本地路径）
 
 直接在 Alife 插件市场中下载；或将 `Alife.Plugin.QQEmoji` 文件夹放入 Alife 的 `Storage/Plugins` 目录，在客户端重载模块即可。
 
+需要 **Alife.Client ≥ 5.0.0**（5.x 主版本）；旧版 4.x 客户端请使用 4.1.0。
+
 ## 致谢
 
 感谢 **周武** **爱奈丽** 提供的 EmoteStealerService.cs 参考。  
